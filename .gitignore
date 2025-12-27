@@ -1,0 +1,8 @@
+HAM10000_clean/
+HAM10000_rejected/
+HAM10000_split_balanced/
+.venv/
+__pycache__/
+*.pyc
+.gemini/
+.agent/
