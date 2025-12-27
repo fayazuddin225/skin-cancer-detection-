@@ -3,6 +3,7 @@ import tensorflow as tf
 from PIL import Image
 import numpy as np
 import os
+import cv2
 
 # --- Page Config ---
 st.set_page_config(
@@ -95,7 +96,7 @@ st.markdown("""
             font-weight: 700 !important;
         }
 
-        /* File Name and Size Visibility (CRITICAL FIX) */
+        /* File Name and Size Visibility */
         .stFileUploader [data-testid="stFileUploaderFileName"], 
         .stFileUploader [data-testid="stFileUploaderFileData"],
         .stFileUploader span {
@@ -107,7 +108,7 @@ st.markdown("""
         /* 'Browse files' button text visibility fix */
         .stFileUploader button {
             background: #ffffff !important;
-            color: #0f172a !important; /* Dark text on light button */
+            color: #0f172a !important;
             border-radius: 12px !important;
             font-weight: 700 !important;
             border: none !important;
@@ -230,6 +231,47 @@ def load_skin_model():
 
 model = load_skin_model()
 
+def is_skin_image(image):
+    """
+    Robustly identify if an image is a skin lesion dermoscopy or non-skin/document.
+    Uses edge-density, color-distribution, and variance checks.
+    """
+    # Convert PIL to OpenCV format (BGR)
+    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    
+    # 1. Edge Density Check (Canny)
+    # Documents have a lot of sharp edges/text. Dermoscopy is smooth.
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = np.sum(edges > 0) / edges.size
+    
+    # 2. Color Analysis (YCrCb)
+    # Skin pixels cluster in a specific chrominance range
+    ycrcb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2YCrCb)
+    # Skin color range in CrCb: Cr(133-173), Cb(77-127)
+    lower = np.array([0, 133, 77], dtype="uint8")
+    upper = np.array([255, 173, 127], dtype="uint8")
+    skin_mask = cv2.inRange(ycrcb, lower, upper)
+    skin_ratio = np.sum(skin_mask > 0) / skin_mask.size
+    
+    # 3. Brightness/Contrast Var
+    # White background documents have high mean brightness and variance
+    mean_val = np.mean(gray)
+    
+    # REJECTION CRITERIA:
+    # - If edge density is too high (>20% pixels are edges), it's likely text/noise.
+    # - If skin ratio is too low (<25%), it's likely not a skin picture.
+    # - If it's too bright (Paper-like > 220), it's potentially a document.
+    
+    if edge_density > 0.18: # High edge density (text/papers)
+        return False, "High edge density detected (likely a document or text)."
+    if skin_ratio < 0.20: # Low skin pixel concentration
+        return False, "Low skin-tone concentration detected."
+    if mean_val > 235: # Extremely bright image
+        return False, "Image brightness profile matches paper/background outliers."
+        
+    return True, "Valid"
+
 # --- Main Columns ---
 c1, c2 = st.columns([1, 1], gap="large")
 
@@ -253,53 +295,57 @@ with c2:
     
     if uploaded_file is not None and model is not None:
         if st.button("Perform Diagnostic Scan"):
-            with st.spinner("Analyzing spectral patterns..."):
-                try:
-                    # Preprocess - Using 224x224 as expected by the model
-                    img = image.resize((224, 224))
-                    img_array = np.array(img)
-                    if img_array.shape[-1] == 4:
-                         img_array = img_array[..., :3]
-                    
-                    img_array = np.expand_dims(img_array, axis=0)
-                    # MobileNetV2 preprocess (scaling pixels to [-1, 1])
-                    processed_img = tf.keras.applications.mobilenet_v2.preprocess_input(img_array.astype(np.float32))
-                    
-                    # Inference
-                    preds = model.predict(processed_img)
-                    score = preds[0]
-                    
-                    # Logic for classification result
-                    if len(score) == 1: # Sigmoid
-                        val = score[0]
-                        res = "Malignant" if val > 0.5 else "Benign"
-                        conf = val * 100 if val > 0.5 else (1 - val) * 100
-                    else: # Softmax
-                        idx = np.argmax(score)
-                        classes = ["Benign", "Malignant"]
-                        res = classes[idx]
-                        conf = score[idx] * 100
-                    
-                    # Visual Output
-                    st.markdown('<div class="result-container">', unsafe_allow_html=True)
-                    badge = "benign-badge" if res == "Benign" else "malignant-badge"
-                    st.markdown(f'<div class="status-badge {badge}">{res.upper()}</div>', unsafe_allow_html=True)
-                    
-                    st.markdown('<div class="confidence-label">AI CONFIDENCE</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="confidence-value">{conf:.1f}%</div>', unsafe_allow_html=True)
-                    st.progress(float(conf/100))
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    st.markdown("""
-                        <div class="info-box">
-                            <strong>Medical Notice:</strong> This analysis is powered by deep learning and is for 
-                            informational purposes only. It should not replace a professional diagnosis. 
-                            If Malignant is indicated, or if you have concerns, please visit a doctor immediately.
-                        </div>
-                    """, unsafe_allow_html=True)
-                    
-                except Exception as e:
-                    st.error(f"Analysis failed: {e}")
+            valid, msg = is_skin_image(image)
+            
+            if not valid:
+                st.error("❌ Upload correct skin picture")
+                st.warning(f"Technical Reason: {msg}")
+            else:
+                with st.spinner("Analyzing spectral patterns..."):
+                    try:
+                        # Preprocess
+                        img = image.resize((224, 224))
+                        img_array = np.array(img)
+                        if img_array.shape[-1] == 4:
+                             img_array = img_array[..., :3]
+                        
+                        img_array = np.expand_dims(img_array, axis=0)
+                        processed_img = tf.keras.applications.mobilenet_v2.preprocess_input(img_array.astype(np.float32))
+                        
+                        # Inference
+                        preds = model.predict(processed_img)
+                        score = preds[0]
+                        
+                        if len(score) == 1: # Sigmoid
+                            val = score[0]
+                            res = "Malignant" if val > 0.5 else "Benign"
+                            conf = val * 100 if val > 0.5 else (1 - val) * 100
+                        else: # Softmax
+                            idx = np.argmax(score)
+                            classes = ["Benign", "Malignant"]
+                            res = classes[idx]
+                            conf = score[idx] * 100
+                        
+                        # Visual Output
+                        st.markdown('<div class="result-container">', unsafe_allow_html=True)
+                        badge = "benign-badge" if res == "Benign" else "malignant-badge"
+                        st.markdown(f'<div class="status-badge {badge}">{res.upper()}</div>', unsafe_allow_html=True)
+                        
+                        st.markdown('<div class="confidence-label">AI CONFIDENCE</div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="confidence-value">{conf:.1f}%</div>', unsafe_allow_html=True)
+                        st.progress(float(conf/100))
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        st.markdown("""
+                            <div class="info-box">
+                                <strong>Medical Notice:</strong> This analysis is powered by deep learning and is for 
+                                informational purposes only. It should not replace a professional diagnosis. 
+                                Consult a specialized dermatologist if Malignant is indicated.
+                            </div>
+                        """, unsafe_allow_html=True)
+                        
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
     elif model is None:
         st.error("System Failure: Model weights not initialized.")
     else:
